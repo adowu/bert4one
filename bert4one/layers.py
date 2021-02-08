@@ -620,6 +620,327 @@ class SinusoidalPositionEmbedding(Layer):
         base_config = super(SinusoidalPositionEmbedding, self).get_config()
         return dict(list(base_config.items()) + list(config.items()))
 
+
+class ConditionalRandomField(Layer):
+    """纯Keras实现CRF层
+    CRF层本质上是一个带训练参数的loss计算层。
+    """
+
+    def __init__(self, lr_multiplier=1, **kwargs):
+        super(ConditionalRandomField, self).__init__(**kwargs)
+        self.lr_multiplier = lr_multiplier  # 当前层学习率的放大倍数
+
+    @integerize_shape
+    def build(self, input_shape):
+        super(ConditionalRandomField, self).build(input_shape)
+        output_dim = input_shape[-1]
+        self._trans = self.add_weight(
+            name='trans',
+            shape=(output_dim, output_dim),
+            initializer='glorot_uniform',
+            trainable=True
+        )
+        if self.lr_multiplier != 1:
+            K.set_value(self._trans, K.eval(self._trans) / self.lr_multiplier)
+
+    @property
+    def trans(self):
+        if self.lr_multiplier != 1:
+            return self.lr_multiplier * self._trans
+        else:
+            return self._trans
+
+    def compute_mask(self, inputs, mask=None):
+        return None
+
+    def call(self, inputs, mask=None):
+        if mask is not None:
+            mask = K.cast(mask, K.floatx())
+
+        return sequence_masking(inputs, mask, 1, 1)
+
+    def target_score(self, y_true, y_pred):
+        """计算目标路径的相对概率（还没有归一化）
+        要点：逐标签得分，加上转移概率得分。
+        """
+        # 每个对应 n 位置 相乘 然后相加 得到这个 b 的得分
+        point_score = tf.einsum('bni,bni->b', y_true, y_pred)  # 逐标签得分
+        # 这里就是计算，当前步到下一步的转移得分，然后累加
+        # 从 第一步 - 倒数第二步
+        # 从 第二步 - 最后一步
+        # 也就是去对应的trans中找对应的下标位置的值
+        trans_score = tf.einsum(
+            'bni,ij,bnj->b', y_true[:, :-1], self.trans, y_true[:, 1:]
+        )  # 标签转移得分
+        return point_score + trans_score
+
+    def log_norm_step(self, inputs, states):
+        """递归计算归一化因子
+        要点：
+            1、递归计算；
+            2、用logsumexp避免溢出。
+
+            inputs: [B, output_dim + 1] RNN 已经在time维度split了，一个时刻一个时刻的进行计算
+            states: [y_pred[:, 0]]    [[B, output_dim]]
+        """
+        # [B, output_dim]  [B, 1]
+        inputs, mask = inputs[:, :-1], inputs[:, -1:]
+        # (batch_size, output_dim, 1) 这个变量可以理解为 t = 0 时刻 在各标签上的得分 H_0(Y_0|x)
+        states = K.expand_dims(states[0], 2)
+        # (1, output_dim, output_dim)
+        trans = K.expand_dims(self.trans, 0)
+        
+        # 当前 t 时刻，某个标签的 得分 分别加上 该标签转移到 别的标签的得分
+        # (batch_size, output_dim, output_dim) 
+        # 第一个 output_dim 表示 当前标签， 第二个output_dim 表示当前标签 转移到别的标签的 得分 = states(模型当前时刻的输出) + trans（转移矩阵）
+        # 最后分别求了 第一个 output_dim 维度的 和 
+        # 这个 和 就是其它标签转移到当前标签的转移和
+        # (batch_size, output_dim)
+        outputs = tf.reduce_logsumexp(
+            # (batch_size, output_dim, output_dim)
+            states + trans, 1
+        )
+        # outputs [B, output_dim] 当前时刻的 标签转移 和
+        # inputs [B, output_dim]  下一时刻的 每个标签 得分
+        # 得到下一时刻的输出 [B, output_dim]
+        outputs = outputs + inputs
+        # mask * outputs  进行 mask 处理
+        # (1 - mask) * states[:, :, 0]  如果mask 为 0 ，则沿用前面的 state
+        outputs = mask * outputs + (1 - mask) * states[:, :, 0]
+        return outputs, [outputs]
+
+    def dense_loss(self, y_true, y_pred):
+        """y_true需要是one hot形式
+        """
+        # 导出mask并转换数据类型
+        # [B, T, 1] 这里也就是看 这个 T 是否是 pad 的
+        mask = K.all(K.greater(y_pred, -1e6), axis=2, keepdims=True)
+        mask = K.cast(mask, K.floatx())
+        # 计算目标分数
+        y_true, y_pred = y_true * mask, y_pred * mask
+        target_score = self.target_score(y_true, y_pred)
+        # 递归计算log Z
+        init_states = [y_pred[:, 0]]
+        # [B, T, output_dim] [B, T, 1] -> [B, T, output_dim+1]
+        # 这里是为了传递 mask 到 rnn 中 
+        y_pred = K.concatenate([y_pred, mask], axis=2)
+        input_length = K.int_shape(y_pred[:, 1:])[1]
+        # 这里会把 y_pred[:, 1:] 在 time 维度 split 开 一个个继续迭代计算
+        log_norm, _, _ = K.rnn(
+            self.log_norm_step,
+            y_pred[:, 1:],
+            init_states,
+            input_length=input_length
+        )  # 最后一步的log Z向量
+        log_norm = tf.reduce_logsumexp(log_norm, 1)  # logsumexp得标量
+        # 计算损失 -log p
+        return log_norm - target_score
+
+    def sparse_loss(self, y_true, y_pred):
+        """y_true需要是整数形式（非one hot）
+        """
+        # y_true需要重新明确一下shape和dtype
+        y_true = K.reshape(y_true, K.shape(y_pred)[:-1])
+        y_true = K.cast(y_true, 'int32')
+        # 转为one hot
+        y_true = K.one_hot(y_true, K.shape(self.trans)[0])
+        return self.dense_loss(y_true, y_pred)
+
+    def dense_accuracy(self, y_true, y_pred):
+        """训练过程中显示逐帧准确率的函数，排除了mask的影响
+        此处y_true需要是one hot形式
+        """
+        y_true = K.argmax(y_true, 2)
+        return self.sparse_accuracy(y_true, y_pred)
+
+    def sparse_accuracy(self, y_true, y_pred):
+        """训练过程中显示逐帧准确率的函数，排除了mask的影响
+        此处y_true需要是整数形式（非one hot）
+        """
+        # 导出mask并转换数据类型
+        mask = K.all(K.greater(y_pred, -1e6), axis=2)
+        mask = K.cast(mask, K.floatx())
+        # y_true需要重新明确一下shape和dtype
+        y_true = K.reshape(y_true, K.shape(y_pred)[:-1])
+        y_true = K.cast(y_true, 'int32')
+        # 逐标签取最大来粗略评测训练效果
+        y_pred = K.cast(K.argmax(y_pred, 2), 'int32')
+        isequal = K.cast(K.equal(y_true, y_pred), K.floatx())
+        return K.sum(isequal * mask) / K.sum(mask)
+
+    def get_config(self):
+        config = {
+            'lr_multiplier': self.lr_multiplier,
+        }
+        base_config = super(ConditionalRandomField, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+def search_layer(inputs, name, exclude=None):
+    """根据inputs和name来搜索层
+    说明：inputs为某个层或某个层的输出；name为目标层的名字。
+    实现：根据inputs一直往上递归搜索，直到发现名字为name的层为止；
+         如果找不到，那就返回None。
+    """
+    if exclude is None:
+        exclude = set()
+
+    if isinstance(inputs, Layer):
+        layer = inputs
+    else:
+        layer = inputs._keras_history[0]
+
+    if layer.name == name:
+        return layer
+    elif layer in exclude:
+        return None
+    else:
+        exclude.add(layer)
+        inbound_layers = layer._inbound_nodes[0].inbound_layers
+        if not isinstance(inbound_layers, list):
+            inbound_layers = [inbound_layers]
+        if len(inbound_layers) > 0:
+            for layer in inbound_layers:
+                layer = search_layer(layer, name, exclude)
+                if layer is not None:
+                    return layer
+
+class MaximumEntropyMarkovModel(Layer):
+
+    def __init__(self, lr_multiplier=1, **kwargs):
+        super(MaximumEntropyMarkovModel, self).__init__(**kwargs)
+        self.lr_multiplier = lr_multiplier  # 当前层学习率的放大倍数
+
+    def build(self, input_shape):
+        output_dim = input_shape[-1]
+        if not isinstance(output_dim, int):
+            output_dim = output_dim.value
+        self._trans = self.add_weight(name='trans',
+                                     shape=(output_dim, output_dim),
+                                     initializer='glorot_uniform',
+                                     trainable=True)
+        if self.lr_multiplier != 1:
+            K.set_value(self._trans, K.eval(self._trans) / self.lr_multiplier)
+
+    @property
+    def trans(self):
+        if self.lr_multiplier != 1:
+            return self.lr_multiplier * self._trans
+        else:
+            return self._trans 
+
+    def call(self, inputs, mask=None):
+        """MEMM本身不改变输出，它只是一个loss
+        """
+        if mask is not None:
+            if not hasattr(self, 'mask_layer'):
+                self.mask_layer = search_layer(inputs, mask)
+
+        return inputs
+
+    @property
+    def output_mask(self):
+        if hasattr(self, 'mask_layer'):
+            return self.mask_layer.output_mask
+
+    def reverse_sequence(self, inputs, mask=None):
+        if mask is None:
+            return [x[:, ::-1] for x in inputs]
+        else:
+            length = K.cast(K.sum(mask, 1), 'int32')
+            return [
+                tf.reverse_sequence(x, length, seq_axis=1)
+                for x in inputs
+            ]
+
+    def basic_loss(self, y_true, y_pred, go_backwards=False):
+        """y_true需要是整数形式（非one hot）
+            y_true: [B, T]
+            y_pred: [B, T, Labels]
+        """
+        mask = self.output_mask
+        y_true = K.cast(y_true, 'int32')
+        y_true = K.reshape(y_true, [K.shape(y_true)[0], -1])
+
+        if go_backwards:
+            y_true, y_pred = self.reverse_sequence([y_true, y_pred], mask)
+            trans = K.transpose(self.trans)
+        else:
+            trans = self.trans
+
+        # loss
+        # [B, T, Labels]
+        history = K.gather(trans, y_true)
+        # y_pred[:, :1]  [B, 1, Labels]
+        # history[:, :-1] [B, T-1, Labels]
+        # history [B, T, Labels]
+        # TODO 这个concatenate 没看明白 怎么个意思
+        history = K.concatenate([y_pred[:, :1], history[:, :-1]], 1)
+        y_pred = (y_pred + history) / 2
+        loss = K.sparse_categorical_crossentropy(
+            y_true, y_pred, from_logits=True)
+        if mask is None:
+            return K.mean(loss)
+
+        else:
+            return K.sum(loss*mask) / K.sum(mask)
+
+    def sparse_loss(self, y_true, y_pred):
+        """y_true需要是整数形式（非one hot）
+            y_true: [B, T]
+            y_pred: [B, T, Labels]
+        """
+        loss = self.basic_loss(y_true, y_pred, False)
+        loss += self.basic_loss(y_true, y_pred, True)
+        return loss / 2
+
+    def basic_accuracy(self, y_true, y_pred, go_backwards=False):
+        """训练过程中显示逐帧准确率的函数，排除了mask的影响
+        此处y_true需要是整数形式（非one hot）
+        """
+        mask = self.output_mask
+        # y_true需要重新明确一下dtype和shape
+        y_true = K.cast(y_true, 'int32')
+        y_true = K.reshape(y_true, [K.shape(y_true)[0], -1])
+        # 是否反转序列
+        if go_backwards:
+            y_true, y_pred = self.reverse_sequence([y_true, y_pred], mask)
+            trans = K.transpose(self.trans)
+        else:
+            trans = self.trans
+        # 计算逐标签accuracy
+        histoty = K.gather(trans, y_true)
+        histoty = K.concatenate([y_pred[:, :1], histoty[:, :-1]], 1)
+        y_pred = (y_pred + histoty) / 2
+        y_pred = K.cast(K.argmax(y_pred, 2), 'int32')
+        isequal = K.cast(K.equal(y_true, y_pred), K.floatx())
+        if mask is None:
+            return K.mean(isequal)
+        else:
+            return K.sum(isequal * mask) / K.sum(mask)
+
+    def sparse_accuracy(self, y_true, y_pred):
+        """训练过程中显示逐帧准确率的函数，排除了mask的影响
+        此处y_true需要是整数形式（非one hot）
+        """
+        accuracy = self.basic_accuracy(y_true, y_pred, False)
+        accuracy = accuracy + self.basic_accuracy(y_true, y_pred, True)
+        return accuracy / 2
+
+    def dense_accuracy(self, y_true, y_pred):
+        """训练过程中显示逐帧准确率的函数，排除了mask的影响
+        此处y_true需要是one hot形式
+        """
+        y_true = K.argmax(y_true, 2)
+        return self.sparse_accuracy(y_true, y_pred)
+
+    def get_config(self):
+        config = {
+            'lr_multiplier': self.lr_multiplier,
+        }
+        base_config = super(MaximumEntropyMarkovModel, self).get_config()
+        return dict(list(base_config.items()) + list(config.items()))
+
+
 # 本函数返回从名称到类别映射的全局字典，更新自定义层到keras中
 keras.utils.get_custom_objects().update({
     'BiasAdd': BiasAdd,
@@ -629,5 +950,7 @@ keras.utils.get_custom_objects().update({
     'RelativePositionEmbedding': RelativePositionEmbedding,
     'SinusoidalPositionEmbedding': SinusoidalPositionEmbedding,
     'LayerNormalization': LayerNormalization,
+    'ConditionalRandomField': ConditionalRandomField,
+    'MaximumEntropyMarkovModel': MaximumEntropyMarkovModel,
 
 })

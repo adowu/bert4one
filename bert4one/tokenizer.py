@@ -1,5 +1,8 @@
-#! -*- coding: utf-8 -*-
-# desc:
+# -*- encoding: utf-8 -*-
+'''
+@Email :  wushaojun0107@gmail.com
+@Time  :  02-07 2021
+'''
 from bert4one.snippets import is_string
 from typing import List
 import unicodedata
